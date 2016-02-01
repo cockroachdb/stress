@@ -20,16 +20,20 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 var (
-	flagP       = flag.Int("p", runtime.NumCPU(), "run `N` processes in parallel")
-	flagTimeout = flag.Duration("timeout", 10*time.Minute, "timeout each process after `duration`")
-	flagKill    = flag.Bool("kill", true, "kill timed out processes if true, otherwise just print pid (to attach with gdb)")
-	flagFailure = flag.String("failure", "", "fail only if output matches `regexp`")
-	flagIgnore  = flag.String("ignore", "", "ignore failure if output matches `regexp`")
+	flagP             = flag.Int("p", runtime.NumCPU(), "run `N` processes in parallel")
+	flagTimeout       = flag.Duration("timeout", 10*time.Minute, "timeout each process after `duration`")
+	flagKill          = flag.Bool("kill", true, "kill timed out processes if true, otherwise just print pid (to attach with gdb)")
+	flagFailure       = flag.String("failure", "", "fail only if output matches `regexp`")
+	flagIgnore        = flag.String("ignore", "", "ignore failure if output matches `regexp`")
+	flagMaxTime       = flag.Duration("maxtime", 0, "maximum time to run")
+	flagMaxRuns       = flag.Int("maxruns", 0, "maximum number of runs")
+	flagQuitAfterFail = flag.Bool("quitAfterFail", false, "quit after the first detected failure if true")
 )
 
 func main() {
@@ -53,10 +57,13 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	startTime := time.Now()
+	finishTime := time.Now().Add(*flagMaxTime)
 	res := make(chan []byte)
+	var exitFlag int32
 	for i := 0; i < *flagP; i++ {
 		go func() {
-			for {
+			for atomic.LoadInt32(&exitFlag) == 0 {
 				cmd := exec.Command(flag.Args()[0], flag.Args()[1:]...)
 				done := make(chan bool)
 				if *flagTimeout > 0 {
@@ -92,10 +99,14 @@ func main() {
 	}
 	runs, fails := 0, 0
 	ticker := time.NewTicker(5 * time.Second).C
-	for {
+	for atomic.LoadInt32(&exitFlag) == 0 {
 		select {
 		case out := <-res:
 			runs++
+			if ((*flagMaxTime > 0) && (time.Now().After(finishTime))) ||
+				((*flagMaxRuns > 0) && (runs >= *flagMaxRuns)) {
+				atomic.StoreInt32(&exitFlag, 1)
+			}
 			if len(out) == 0 {
 				continue
 			}
@@ -111,8 +122,12 @@ func main() {
 				out = out[:2<<10]
 			}
 			fmt.Printf("\n%s\n%s\n", f.Name(), out)
+			if *flagQuitAfterFail {
+				atomic.StoreInt32(&exitFlag, 1)
+			}
 		case <-ticker:
-			fmt.Printf("%v runs so far, %v failures\n", runs, fails)
+			fmt.Printf("%v runs so far, %v failures, over %s\n", runs, fails, time.Since(startTime))
 		}
 	}
+	fmt.Printf("%v runs completed, %v failures, over %s\n", runs, fails, time.Since(startTime))
 }
