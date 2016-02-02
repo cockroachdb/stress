@@ -34,6 +34,7 @@ var (
 	flagMaxTime  = flag.Duration("maxtime", 0, "maximum time to run")
 	flagMaxRuns  = flag.Int("maxruns", 0, "maximum number of runs")
 	flagMaxFails = flag.Int("maxfails", 0, "maximum number of failures")
+	flagStdErr   = flag.Bool("stderr", false, "output failures to STDERR instead of to a temp file")
 )
 
 func main() {
@@ -114,20 +115,29 @@ func main() {
 			if (*flagMaxFails > 0) && (fails >= *flagMaxFails) {
 				atomic.StoreInt32(&exitFlag, 1)
 			}
-			f, err := ioutil.TempFile("", "go-stress")
-			if err != nil {
-				fmt.Printf("failed to create temp file: %v\n", err)
-				os.Exit(1)
+			if *flagStdErr {
+				fmt.Fprintf(os.Stderr, "\n%s\n", out)
+			} else {
+				f, err := ioutil.TempFile("", "go-stress")
+				if err != nil {
+					fmt.Printf("failed to create temp file: %v\n", err)
+					os.Exit(1)
+				}
+				f.Write(out)
+				f.Close()
+				if len(out) > 2<<10 {
+					out = out[:2<<10]
+				}
+				fmt.Printf("\n%s\n%s\n", f.Name(), out)
 			}
-			f.Write(out)
-			f.Close()
-			if len(out) > 2<<10 {
-				out = out[:2<<10]
-			}
-			fmt.Printf("\n%s\n%s\n", f.Name(), out)
 		case <-ticker:
 			fmt.Printf("%v runs so far, %v failures, over %s\n", runs, fails, time.Since(startTime))
 		}
 	}
 	fmt.Printf("%v runs completed, %v failures, over %s\n", runs, fails, time.Since(startTime))
+	if fails > 0 {
+		fmt.Println("FAIL")
+	} else {
+		fmt.Println("SUCCESS")
+	}
 }
