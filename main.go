@@ -26,14 +26,14 @@ import (
 )
 
 var (
-	flagP             = flag.Int("p", runtime.NumCPU(), "run `N` processes in parallel")
-	flagTimeout       = flag.Duration("timeout", 10*time.Minute, "timeout each process after `duration`")
-	flagKill          = flag.Bool("kill", true, "kill timed out processes if true, otherwise just print pid (to attach with gdb)")
-	flagFailure       = flag.String("failure", "", "fail only if output matches `regexp`")
-	flagIgnore        = flag.String("ignore", "", "ignore failure if output matches `regexp`")
-	flagMaxTime       = flag.Duration("maxtime", 0, "maximum time to run")
-	flagMaxRuns       = flag.Int("maxruns", 0, "maximum number of runs")
-	flagQuitAfterFail = flag.Bool("quitAfterFail", false, "quit after the first detected failure if true")
+	flagP        = flag.Int("p", runtime.NumCPU(), "run `N` processes in parallel")
+	flagTimeout  = flag.Duration("timeout", 10*time.Minute, "timeout each process after `duration`")
+	flagKill     = flag.Bool("kill", true, "kill timed out processes if true, otherwise just print pid (to attach with gdb)")
+	flagFailure  = flag.String("failure", "", "fail only if output matches `regexp`")
+	flagIgnore   = flag.String("ignore", "", "ignore failure if output matches `regexp`")
+	flagMaxTime  = flag.Duration("maxtime", 0, "maximum time to run")
+	flagMaxRuns  = flag.Int("maxruns", 0, "maximum number of runs")
+	flagMaxFails = flag.Int("maxfails", 0, "maximum number of failures")
 )
 
 func main() {
@@ -111,6 +111,9 @@ func main() {
 				continue
 			}
 			fails++
+			if (*flagMaxFails > 0) && (fails >= *flagMaxFails) {
+				atomic.StoreInt32(&exitFlag, 1)
+			}
 			f, err := ioutil.TempFile("", "go-stress")
 			if err != nil {
 				fmt.Printf("failed to create temp file: %v\n", err)
@@ -122,9 +125,6 @@ func main() {
 				out = out[:2<<10]
 			}
 			fmt.Printf("\n%s\n%s\n", f.Name(), out)
-			if *flagQuitAfterFail {
-				atomic.StoreInt32(&exitFlag, 1)
-			}
 		case <-ticker:
 			fmt.Printf("%v runs so far, %v failures, over %s\n", runs, fails, time.Since(startTime))
 		}
