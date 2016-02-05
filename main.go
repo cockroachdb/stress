@@ -37,6 +37,10 @@ var (
 	flagStdErr   = flag.Bool("stderr", false, "output failures to STDERR instead of to a temp file")
 )
 
+func roundToSeconds(d time.Duration) time.Duration {
+	return time.Duration(d.Seconds()+0.5) * time.Second
+}
+
 func main() {
 	flag.Parse()
 	if *flagP <= 0 || *flagTimeout <= 0 || len(flag.Args()) == 0 {
@@ -131,10 +135,12 @@ func main() {
 				fmt.Printf("\n%s\n%s\n", f.Name(), out)
 			}
 		case <-ticker:
-			fmt.Printf("%v runs so far, %v failures, over %s\n", runs, fails, time.Since(startTime))
+			fmt.Printf("%v runs so far, %v failures, over %s\n",
+				runs, fails, roundToSeconds(time.Since(startTime)))
 		}
 	}
-	fmt.Printf("%v runs completed, %v failures, over %s\n", runs, fails, time.Since(startTime))
+	fmt.Printf("%v runs completed, %v failures, over %s\n",
+		runs, fails, roundToSeconds(time.Since(startTime)))
 	if fails > 0 {
 		fmt.Println("FAIL")
 	} else {
