@@ -143,6 +143,7 @@ func main() {
 		runs, fails, roundToSeconds(time.Since(startTime)))
 	if fails > 0 {
 		fmt.Println("FAIL")
+		os.Exit(1)
 	} else {
 		fmt.Println("SUCCESS")
 	}
