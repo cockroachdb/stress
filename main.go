@@ -33,8 +33,8 @@ var (
 	flagIgnore   = flag.String("ignore", "", "ignore failure if output matches `regexp`")
 	flagMaxTime  = flag.Duration("maxtime", 0, "maximum time to run")
 	flagMaxRuns  = flag.Int("maxruns", 0, "maximum number of runs")
-	flagMaxFails = flag.Int("maxfails", 0, "maximum number of failures")
-	flagStdErr   = flag.Bool("stderr", false, "output failures to STDERR instead of to a temp file")
+	flagMaxFails = flag.Int("maxfails", 1, "maximum number of failures")
+	flagStdErr   = flag.Bool("stderr", true, "output failures to STDERR instead of to a temp file")
 )
 
 func roundToSeconds(d time.Duration) time.Duration {
