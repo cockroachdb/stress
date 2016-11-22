@@ -27,7 +27,7 @@ import (
 
 var (
 	flagP        = flag.Int("p", runtime.NumCPU(), "run `N` processes in parallel")
-	flagTimeout  = flag.Duration("timeout", 10*time.Minute, "timeout each process after `duration`")
+	flagTimeout  = flag.Duration("timeout", 0, "timeout each process after `duration`")
 	flagKill     = flag.Bool("kill", true, "kill timed out processes if true, otherwise just print pid (to attach with gdb)")
 	flagFailure  = flag.String("failure", "", "fail only if output matches `regexp`")
 	flagIgnore   = flag.String("ignore", "", "ignore failure if output matches `regexp`")
