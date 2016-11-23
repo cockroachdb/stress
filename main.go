@@ -43,7 +43,7 @@ func roundToSeconds(d time.Duration) time.Duration {
 
 func main() {
 	flag.Parse()
-	if *flagP <= 0 || *flagTimeout <= 0 || len(flag.Args()) == 0 {
+	if *flagP <= 0 || *flagTimeout < 0 || len(flag.Args()) == 0 {
 		flag.Usage()
 		os.Exit(1)
 	}
