@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -40,6 +41,7 @@ var (
 	flagMaxRuns  = flags.Int("maxruns", 0, "maximum number of runs")
 	flagMaxFails = flags.Int("maxfails", 1, "maximum number of failures")
 	flagStdErr   = flags.Bool("stderr", true, "output failures to STDERR instead of to a temp file")
+	flagCluster  = flags.String("cluster", "", "roachprod cluster to run tests on")
 )
 
 func roundToSeconds(d time.Duration) time.Duration {
@@ -70,6 +72,37 @@ func run() error {
 		}
 	}
 
+	args := flags.Args()
+	nodes := 1
+	nodeArgs := func(i int) []string {
+		return args
+	}
+
+	if *flagCluster != "" {
+		cmd := exec.Command("roachprod", "status", *flagCluster)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("%v\n%s", err, out)
+		}
+		nodes = strings.Count(string(out), "\n") - 1
+
+		cmd = exec.Command("roachprod", "put", *flagCluster, args[0])
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return err
+		}
+		nodeArgs = func(i int) []string {
+			return []string{
+				"roachprod",
+				"ssh",
+				fmt.Sprintf("%s:%d", *flagCluster, i+1),
+				"--",
+				strings.Join(args, " "),
+			}
+		}
+	}
+
 	c := make(chan os.Signal)
 	defer close(c)
 	signal.Notify(c, os.Interrupt)
@@ -94,39 +127,42 @@ func run() error {
 	startTime := time.Now()
 
 	res := make(chan []byte)
-	wg.Add(*flagP)
-	for i := 0; i < *flagP; i++ {
-		go func(ctx context.Context) {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case res <- func(ctx context.Context) []byte {
-					var cmd *exec.Cmd
-					if *flagTimeout > 0 {
-						if *flagKill {
-							var cancel context.CancelFunc
-							ctx, cancel = context.WithTimeout(ctx, *flagTimeout)
-							defer cancel()
-						} else {
-							defer time.AfterFunc(*flagTimeout, func() {
-								fmt.Printf("process %v timed out\n", cmd.Process.Pid)
-							}).Stop()
+	wg.Add(*flagP * nodes)
+	for j := 0; j < nodes; j++ {
+		args := nodeArgs(j)
+		for i := 0; i < *flagP; i++ {
+			go func(ctx context.Context, args []string) {
+				defer wg.Done()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case res <- func(ctx context.Context) []byte {
+						var cmd *exec.Cmd
+						if *flagTimeout > 0 {
+							if *flagKill {
+								var cancel context.CancelFunc
+								ctx, cancel = context.WithTimeout(ctx, *flagTimeout)
+								defer cancel()
+							} else {
+								defer time.AfterFunc(*flagTimeout, func() {
+									fmt.Printf("process %v timed out\n", cmd.Process.Pid)
+								}).Stop()
+							}
 						}
+						cmd = exec.CommandContext(ctx, args[0], args[1:]...)
+						out, err := cmd.CombinedOutput()
+						if err != nil && (failureRe == nil || failureRe.Match(out)) && (ignoreRe == nil || !ignoreRe.Match(out)) {
+							out = append(out, fmt.Sprintf("\n\nERROR: %v\n", err)...)
+						} else {
+							out = []byte{}
+						}
+						return out
+					}(ctx):
 					}
-					cmd = exec.CommandContext(ctx, flags.Args()[0], flags.Args()[1:]...)
-					out, err := cmd.CombinedOutput()
-					if err != nil && (failureRe == nil || failureRe.Match(out)) && (ignoreRe == nil || !ignoreRe.Match(out)) {
-						out = append(out, fmt.Sprintf("\n\nERROR: %v\n", err)...)
-					} else {
-						out = []byte{}
-					}
-					return out
-				}(ctx):
 				}
-			}
-		}(ctx)
+			}(ctx, args)
+		}
 	}
 	runs, fails := 0, 0
 	ticker := time.NewTicker(5 * time.Second).C
