@@ -2,197 +2,280 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// The stress utility is intended for catching of episodic failures.
-// It runs a given process in parallel in a loop and collects any failures.
-// Usage:
-// 	$ stress ./fmt.test -test.run=TestSometing -test.cpu=10
-// You can also specify a number of parallel processes with -p flag;
-// instruct the utility to not kill hanged processes for gdb attach;
-// or specify the failure output you are looking for (if you want to
-// ignore some other episodic failures).
+// The stress utility is intended for catching of episodic failures. It runs a
+// given process in parallel in a loop and collects any failures.
+//
+// Example usage:
+//
+// 	$ stress ./mypkg.test -test.run=TestSomething
+//
+// You can also specify a number of parallel processes with -p flag; instruct
+// the utility to not kill hanged processes for gdb attach; or specify the
+// failure output you are looking for (if you want to ignore some other episodic
+// failures).
+//
+// Additional flags are available to tune how many iterations to run (either by
+// time or count). In either case, however, a successful stress run will always
+// have completed at least one iteration, and in-flight work will be allowed to
+// complete before returning.
 package main
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"os/signal"
 	"regexp"
 	"runtime"
-	"sync"
 	"syscall"
 	"time"
 )
 
-var (
-	flags        = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
-	flagP        = flags.Int("p", runtime.NumCPU(), "run `N` processes in parallel")
-	flagTimeout  = flags.Duration("timeout", 0, "timeout each process after `duration`")
-	flagKill     = flags.Bool("kill", true, "kill timed out processes if true, otherwise just print pid (to attach with gdb)")
-	flagFailure  = flags.String("failure", "", "fail only if output matches `regexp`")
-	flagIgnore   = flags.String("ignore", "", "ignore failure if output matches `regexp`")
-	flagMaxTime  = flags.Duration("maxtime", 0, "maximum time to run")
-	flagMaxRuns  = flags.Int("maxruns", 0, "maximum number of runs")
-	flagMaxFails = flags.Int("maxfails", 1, "maximum number of failures")
-	flagStdErr   = flags.Bool("stderr", true, "output failures to STDERR instead of to a temp file")
-)
-
-func roundToSeconds(d time.Duration) time.Duration {
-	return time.Duration(d.Seconds()+0.5) * time.Second
+type regexpVar struct {
+	*regexp.Regexp
 }
 
-func run() error {
-	if err := flags.Parse(os.Args[1:]); err != nil {
+func (r *regexpVar) Set(s string) error {
+	if s == "" {
+		return nil
+	}
+	re, err := regexp.Compile(s)
+	if err != nil {
 		return err
 	}
-	if *flagP <= 0 || *flagTimeout < 0 || len(flags.Args()) == 0 {
-		var b bytes.Buffer
-		flags.SetOutput(&b)
-		flags.Usage()
-		return errors.New(b.String())
+	*r = regexpVar{re}
+	return nil
+}
+
+func (r *regexpVar) String() string {
+	if r.Regexp == nil {
+		return ""
 	}
-	var failureRe, ignoreRe *regexp.Regexp
-	if *flagFailure != "" {
-		var err error
-		if failureRe, err = regexp.Compile(*flagFailure); err != nil {
-			return fmt.Errorf("bad failure regexp: %s", err)
-		}
-	}
-	if *flagIgnore != "" {
-		var err error
-		if ignoreRe, err = regexp.Compile(*flagIgnore); err != nil {
-			return fmt.Errorf("bad ignore regexp: %s", err)
-		}
+	return r.Regexp.String()
+}
+
+type flagT struct {
+	p               int
+	timeout         time.Duration
+	kill            bool
+	failure, ignore regexpVar
+	maxtime         time.Duration
+	maxruns         int
+	maxfails        int
+	stderr          bool
+
+	// Only for testing.
+	timeless bool
+}
+
+var opts flagT
+
+func init() {
+	flag.IntVar(&opts.p, "p", runtime.NumCPU(), "run `N` processes in parallel")
+	flag.DurationVar(&opts.timeout, "timeout", 0, "timeout each process after `duration`")
+	flag.BoolVar(&opts.kill, "kill", true, "kill timed out processes if true, "+
+		"otherwise just print pid (to attach with gdb) and do not fail stress")
+	flag.Var(&opts.failure, "failure", "fail only if output matches `regexp`")
+	flag.Var(&opts.ignore, "ignore", "ignore failure if output matches `regexp`")
+	flag.DurationVar(&opts.maxtime, "maxtime", 0, "drain after duration has elapsed")
+	flag.IntVar(&opts.maxruns, "maxruns", 0, "maximum number of runs")
+	flag.IntVar(&opts.maxfails, "maxfails", 1, "maximum number of failures")
+	flag.BoolVar(&opts.stderr, "stderr", true, "output failures to STDERR instead of to a temp file")
+}
+
+func work(ctx context.Context, opts flagT) []byte {
+	var cmd *exec.Cmd
+
+	if opts.timeout > 0 && !opts.kill {
+		defer time.AfterFunc(opts.timeout, func() {
+			fmt.Printf("process %v timed out\n", cmd.Process.Pid)
+		}).Stop()
+
 	}
 
+	cmd = exec.CommandContext(ctx, flag.Args()[0], flag.Args()[1:]...)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	out = append(out, fmt.Sprintf("\n\nERROR: %v\n", err)...)
+	out = append(out, '\n')
+	return out
+}
+
+func run(ctx context.Context, stdout, stderr io.Writer, opts flagT, work func(context.Context, flagT) []byte) (runs int, fails int) {
+	if opts.p == 0 {
+		fmt.Println(stderr, "can't run with concurrency zero")
+		return 0, 1
+	}
+	startTime := time.Now()
+
+	// Set up a context that cancels when a signal is received. On signal,
+	// pending invocations of the command are aborted and stress will terminate
+	// nonzero.
 	c := make(chan os.Signal)
 	defer close(c)
 	signal.Notify(c, os.Interrupt)
 	// TODO(tamird): put this behind a !windows build tag.
 	signal.Notify(c, syscall.SIGHUP, syscall.SIGTERM)
 	defer signal.Stop(c)
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	ctx, cancel := func(ctx context.Context) (context.Context, context.CancelFunc) {
-		if *flagMaxTime > 0 {
-			return context.WithTimeout(ctx, *flagMaxTime)
-		}
-		return context.WithCancel(ctx)
-	}(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() {
-		for range c {
+		select {
+		case <-c:
 			cancel()
+		case <-ctx.Done():
 		}
 	}()
 
-	startTime := time.Now()
+	sem := make(chan struct{}, opts.p)
+	failCh := make(chan []byte)
 
-	res := make(chan []byte)
-	wg.Add(*flagP)
-	for i := 0; i < *flagP; i++ {
-		go func(ctx context.Context) {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case res <- func(ctx context.Context) []byte {
-					var cmd *exec.Cmd
-					if *flagTimeout > 0 {
-						if *flagKill {
-							var cancel context.CancelFunc
-							ctx, cancel = context.WithTimeout(ctx, *flagTimeout)
-							defer cancel()
-						} else {
-							defer time.AfterFunc(*flagTimeout, func() {
-								fmt.Printf("process %v timed out\n", cmd.Process.Pid)
-							}).Stop()
-						}
-					}
-					cmd = exec.CommandContext(ctx, flags.Args()[0], flags.Args()[1:]...)
-					out, err := cmd.CombinedOutput()
-					if err != nil && (failureRe == nil || failureRe.Match(out)) && (ignoreRe == nil || !ignoreRe.Match(out)) {
-						out = append(out, fmt.Sprintf("\n\nERROR: %v\n", err)...)
-					} else {
-						out = []byte{}
-					}
-					return out
-				}(ctx):
-				}
-			}
-		}(ctx)
+	onFail := func(out []byte) {
+		// The context only gets canceled via a signal or when maxFailed becomes
+		// true below. If it's already canceled now, then additional test output
+		// is not desired (it's likely just processes that got killed).
+		if ctx.Err() != nil {
+			return
+		}
+
+		runs++
+		if out == nil {
+			return
+		}
+		fails++
+		if maxFailed := opts.maxfails > 0 && fails >= opts.maxfails; maxFailed {
+			cancel()
+		}
+		printFailure(stdout, stderr, out)
+
 	}
-	runs, fails := 0, 0
-	ticker := time.NewTicker(5 * time.Second).C
+
+	defer func() {
+		// Wait for any in-flight work to terminate. The main goroutine is the
+		// one initiating new work and it's now in this defer, so this should
+		// happen soon.
+		for i := 0; i < cap(sem); {
+			select {
+			case sem <- struct{}{}:
+				i++
+			case out := <-failCh:
+				onFail(out)
+			}
+		}
+
+		if fails == 0 {
+			if err := ctx.Err(); err != nil && fails == 0 {
+				fmt.Fprintln(stderr, err)
+				fails++
+			}
+			if runs == 0 && fails == 0 {
+				fmt.Fprintln(stderr, "bug: expected to run at least one iteration of stress")
+				fails++
+			}
+		}
+
+		fmt.Fprintf(stdout, "%v runs completed, %v failures, over %s\n",
+			runs, fails, roundToSeconds(time.Since(startTime)))
+	}()
+
+	tickerDuration := 5 * time.Second
+	ticker := time.NewTicker(tickerDuration).C
+	if opts.timeless {
+		ticker = nil // disable ticker
+	}
+
+	iters := 0
 	for {
 		select {
-		case out := <-res:
-			runs++
-			if *flagMaxRuns > 0 && runs >= *flagMaxRuns {
-				cancel()
+		case out := <-failCh:
+			onFail(out)
+		case sem <- struct{}{}:
+			if ctx.Err() != nil ||
+				(opts.maxruns > 0 && iters >= opts.maxruns) ||
+				(opts.maxtime > 0 && iters > 0 && time.Since(startTime) >= opts.maxtime) {
+				<-sem
+				return
 			}
-			if len(out) == 0 {
-				continue
-			}
-			fails++
-			if *flagMaxFails > 0 && fails >= *flagMaxFails {
-				cancel()
-			}
-			if *flagStdErr {
-				fmt.Fprintf(os.Stderr, "\n%s\n", out)
-			} else {
-				f, err := ioutil.TempFile("", "go-stress")
-				if err != nil {
-					return fmt.Errorf("failed to create temp file: %v", err)
+			iters++
+			go func(ctx context.Context) {
+				defer func() { <-sem }()
+
+				if opts.timeout > 0 && opts.kill {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, opts.timeout)
+					defer cancel()
 				}
-				if _, err := f.Write(out); err != nil {
-					return fmt.Errorf("failed to write temp file: %v", err)
+				out := work(ctx, opts)
+
+				if err := ctx.Err(); err != nil && out == nil {
+					out = []byte(ctx.Err().Error())
 				}
-				if err := f.Close(); err != nil {
-					return fmt.Errorf("failed to close temp file: %v", err)
+				if (opts.failure.Regexp != nil && !opts.failure.Match(out)) || (opts.ignore.Regexp != nil && opts.ignore.Match(out)) {
+					out = nil
 				}
-				if len(out) > 2<<10 {
-					out = out[:2<<10]
-				}
-				fmt.Printf("\n%s\n%s\n", f.Name(), out)
-			}
+				failCh <- out
+			}(ctx)
 		case <-ticker:
-			fmt.Printf("%v runs so far, %v failures, over %s\n",
-				runs, fails, roundToSeconds(time.Since(startTime)))
-		case <-ctx.Done():
-
-			fmt.Printf("%v runs completed, %v failures, over %s\n",
-				runs, fails, roundToSeconds(time.Since(startTime)))
-
-			switch err := ctx.Err(); err {
-			// A context timeout in this case is indicative of no failures
-			// being detected in the allotted duration.
-			case context.DeadlineExceeded:
-				return nil
-			case context.Canceled:
-				if *flagMaxRuns > 0 && runs >= *flagMaxRuns {
-					return nil
-				}
-				return err
-			default:
-				return fmt.Errorf("unexpected context error: %v", err)
+			elapsed := roundToSeconds(time.Since(startTime))
+			if opts.timeless {
+				elapsed = 123 * time.Second
 			}
+			fmt.Fprintf(stdout, "%v runs so far, %v failures, over %s\n", runs, fails, elapsed)
+		case <-ctx.Done(): // only triggered on signal
+			return
 		}
 	}
 }
 
 func main() {
-	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+	if !flag.Parsed() {
+		flag.Parse()
+	}
+	_, fails := run(context.Background(), os.Stdout, os.Stderr, opts, work)
+	if fails > 0 {
 		fmt.Println("FAIL")
 		os.Exit(1)
 	} else {
 		fmt.Println("SUCCESS")
+	}
+}
+
+func roundToSeconds(d time.Duration) time.Duration {
+	return time.Duration(d.Seconds()+0.5) * time.Second
+}
+
+func printFailure(stdout, stderr io.Writer, out []byte) {
+	if !opts.stderr {
+		err := func() error {
+			f, err := ioutil.TempFile("", "go-stress")
+			if err != nil {
+				return fmt.Errorf("failed to create temp file: %v", err)
+			}
+			if _, err := f.Write(out); err != nil {
+				return fmt.Errorf("failed to write temp file: %v", err)
+			}
+			if err := f.Close(); err != nil {
+				return fmt.Errorf("failed to close temp file: %v", err)
+			}
+			if len(out) > 2<<10 {
+				out = out[:2<<10]
+			}
+			fmt.Fprintf(stdout, "\n%s\n%s\n", f.Name(), out)
+			return nil
+		}()
+		if err == nil {
+			return
+		}
+		fmt.Fprintln(stderr, err)
+		// Failed to create file, fallthrough to stderr below.
+	}
+	if out != nil {
+		fmt.Fprintf(stderr, "\n%s\n", out)
 	}
 }
