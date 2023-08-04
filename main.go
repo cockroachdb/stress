@@ -319,11 +319,7 @@ func run() error {
 				}
 			}
 			switch err := ctx.Err(); err {
-			// A context timeout in this case is indicative of no failures
-			// being detected in the allotted duration.
-			case context.DeadlineExceeded:
-				return nil
-			case context.Canceled:
+			case context.Canceled, context.DeadlineExceeded:
 				if *flagMaxRuns > 0 && runs >= *flagMaxRuns {
 					return nil
 				}
