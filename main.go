@@ -5,7 +5,9 @@
 // The stress utility is intended for catching of episodic failures.
 // It runs a given process in parallel in a loop and collects any failures.
 // Usage:
-// 	$ stress ./fmt.test -test.run=TestSometing -test.cpu=10
+//
+//	$ stress ./fmt.test -test.run=TestSometing -test.cpu=10
+//
 // You can also specify a number of parallel processes with -p flag;
 // instruct the utility to not kill hanged processes for gdb attach;
 // or specify the failure output you are looking for (if you want to
@@ -25,6 +27,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -33,7 +36,7 @@ import (
 
 var (
 	flags             = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
-	flagP             = flags.Int("p", runtime.NumCPU(), "run `N` processes in parallel")
+	flagP             = flags.String("p", fmt.Sprint(runtime.NumCPU()), "run N processes in parallel; use P% (e.g. 50%) to specify a value relative to the number of CPUs")
 	flagTimeout       = flags.Duration("timeout", 0, "timeout each process after `duration`")
 	flagKill          = flags.Bool("kill", true, "kill timed out processes if true, otherwise just print pid (to attach with gdb)")
 	flagFailure       = flags.String("failure", "", "fail only if output matches `regexp`")
@@ -59,6 +62,21 @@ type runResult struct {
 type mergeProgram struct {
 	program string
 	args    []string
+}
+
+func parseParallelism(str string, numCPUs int) (int, error) {
+	str, isPercent := strings.CutSuffix(str, "%")
+	val, err := strconv.Atoi(str)
+	if err != nil || val <= 0 || val >= 10000 {
+		return 0, fmt.Errorf("invalid -p value %q", str)
+	}
+	if isPercent {
+		val = (val*numCPUs + 50) / 100
+		if val < 1 {
+			val = 1
+		}
+	}
+	return val, nil
 }
 
 func roundToSeconds(d time.Duration) time.Duration {
@@ -102,7 +120,11 @@ func run() error {
 	}
 	environ := os.Environ()
 	environ = environ[0:len(environ):len(environ)]
-	if *flagP <= 0 || *flagTimeout < 0 || len(flags.Args()) == 0 {
+	p, err := parseParallelism(*flagP, runtime.NumCPU())
+	if err != nil {
+		return err
+	}
+	if *flagTimeout < 0 || len(flags.Args()) == 0 {
 		var b bytes.Buffer
 		flags.SetOutput(&b)
 		flags.Usage()
@@ -146,8 +168,8 @@ func run() error {
 	startTime := time.Now()
 
 	res := make(chan runResult)
-	wg.Add(*flagP)
-	for i := 0; i < *flagP; i++ {
+	wg.Add(p)
+	for i := 0; i < p; i++ {
 		go func(ctx context.Context, shardNum int) {
 			defer wg.Done()
 			run := 1
